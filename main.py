@@ -138,7 +138,29 @@ def check_login_risk_internal(db: Session, email: str, current_country: str):
         "risk_detected": len(alerts) > 0,
         "alerts": alerts
     }
-
+def get_client_ip(request: Request) -> str:
+    """
+    Get real client IP address from request
+    Handles proxies, load balancers, and cloud providers
+    """
+    # Try X-Forwarded-For first (standard proxy header)
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        # X-Forwarded-For can contain multiple IPs, first one is the client
+        return forwarded_for.split(",")[0].strip()
+    
+    # Try X-Real-IP (used by some proxies)
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip.strip()
+    
+    # Try CF-Connecting-IP (Cloudflare)
+    cf_ip = request.headers.get("CF-Connecting-IP")
+    if cf_ip:
+        return cf_ip.strip()
+    
+    # Fallback to direct connection IP
+    return request.client.host
 # ---------------- ENDPOINTS ----------------
 
 @app.get("/")
@@ -237,7 +259,9 @@ def ip_reputation(ip: str):
 def login(data: LoginRequest, request: Request, db: Session = Depends(get_db)):
     """Authenticate user and log login attempt"""
     
-    ip = request.client.host
+    # Get real client IP
+    ip = get_client_ip(request)
+    
     user_agent = request.headers.get("user-agent", "Unknown")
     country = get_country(ip)
     
@@ -262,7 +286,6 @@ def login(data: LoginRequest, request: Request, db: Session = Depends(get_db)):
         "risk_alerts": risk_check.get("alerts", []),
         "timestamp": format_ist(get_ist_time())
     }
-
 @app.get("/login-history/{email}")
 def get_login_history(email: str, limit: int = 20, db: Session = Depends(get_db)):
     """Get recent login history for an email"""

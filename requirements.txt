@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+requests
+python-dotenv
+sqlalchemy
+psycopg2-binary
+pydantic
+bcrypt
+pytz
+pydantic
+email-validator
+user-agents
+

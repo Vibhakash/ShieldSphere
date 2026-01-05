@@ -37,6 +37,11 @@ class User(Base):
     created_at = Column(DateTime, default=get_ist_time)  # IST time
     is_active = Column(Boolean, default=True)
 
+
+    # 2FA columns
+    twofa_secret = Column(String, nullable=True)  # Stores the 2FA secret
+    is_2fa_enabled = Column(Boolean, default=False)  # Whether 2FA is enabled
+
 class LoginEvent(Base):
     __tablename__ = "login_events"
 
@@ -47,5 +52,3 @@ class LoginEvent(Base):
     success = Column(Boolean)
     timestamp = Column(DateTime, default=get_ist_time)  # IST time
     user_agent = Column(String, nullable=True)
-
-

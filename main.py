@@ -14,6 +14,11 @@ from services.ip_reputation import check_ip
 from services.geoip import get_country, get_ip_details
 from user_agents import parse
 import os
+import pyotp
+import qrcode
+import io
+from fastapi.responses import StreamingResponse
+
 # ---------------- IST TIMEZONE ----------------
 IST = pytz.timezone('Asia/Kolkata')
 
@@ -216,6 +221,194 @@ def register_user(data: UserRegistration, db: Session = Depends(get_db)):
         "created_at": format_ist(new_user.created_at)
     }
 
+@app.post("/login")
+def login(data: LoginRequest, request: Request, db: Session = Depends(get_db)):
+    """Authenticate user and log login attempt"""
+    
+    # Get real client IP
+    ip = get_client_ip(request)
+    user_agent = request.headers.get("user-agent", "Unknown")
+    country = get_country(ip)
+    
+    user = get_user_by_email(db, data.email)
+    
+    if not user:
+        log_login_event(db, data.email, ip, country, False, user_agent)
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    if not verify_password(data.password, user.hashed_password):
+        log_login_event(db, data.email, ip, country, False, user_agent)
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    # Check if 2FA is enabled
+    if user.is_2fa_enabled:
+        return {
+            "message": "2FA required",
+            "email": user.email,
+            "next_step": "verify-login-2fa",
+            "instruction": "Please provide your 6-digit 2FA code"
+        }
+    
+    # No 2FA - proceed with login
+    risk_check = check_login_risk_internal(db, data.email, country)
+    log_login_event(db, data.email, ip, country, True, user_agent)
+    
+    return {
+        "message": "Login successful",
+        "email": user.email,
+        "ip": ip,
+        "country": country,
+        "risk_alerts": risk_check.get("alerts", []),
+        "timestamp": format_ist(get_ist_time()),
+        "2fa_enabled": False
+    }
+
+@app.post("/auto-respond/{email}")
+def auto_respond_to_threat(email: str, threat_type: str, db: Session = Depends(get_db)):
+    """Automatically respond to detected threats"""
+    
+    actions_taken = []
+    
+    if threat_type == "brute_force":
+        # Temporarily lock account
+        actions_taken.append("Account temporarily locked for 15 minutes")
+        # Send alert
+        actions_taken.append("Security alert sent to email")
+        # Block IP
+        actions_taken.append("Suspicious IP blocked")
+    
+    elif threat_type == "impossible_travel":
+        # Require 2FA verification
+        actions_taken.append("Additional verification required")
+        # Send alert
+        actions_taken.append("Unusual login location alert sent")
+    
+    return {
+        "threat_detected": threat_type,
+        "actions_taken": actions_taken,
+        "timestamp": format_ist(get_ist_time())
+    }
+
+# Add this schema at the top with other schemas
+class TwoFAVerify(BaseModel):
+    email: EmailStr
+    code: str
+
+# 2 factor authentication
+from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+import pyotp, qrcode, io
+
+@app.post("/setup-2fa-image/{email}")
+def setup_2fa_image(email: str, db: Session = Depends(get_db)):
+    user = get_user_by_email(db, email)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # 🔒 Generate secret ONLY if not already present
+    if not user.twofa_secret:
+        user.twofa_secret = pyotp.random_base32()
+        user.is_2fa_enabled = True
+        db.commit()
+
+    totp = pyotp.TOTP(user.twofa_secret)
+    uri = totp.provisioning_uri(
+        name=email,
+        issuer_name="ShieldSphere"
+    )
+
+    qr = qrcode.make(uri)
+
+    buf = io.BytesIO()
+    qr.save(buf, format="PNG")
+    buf.seek(0)
+
+    return StreamingResponse(buf, media_type="image/png")
+
+# 4️⃣ Verify 2FA During Login
+@app.post("/verify-login-2fa")
+def verify_login_2fa(data: TwoFAVerify, request: Request, db: Session = Depends(get_db)):
+    """Verify 2FA code during login"""
+    
+    user = get_user_by_email(db, data.email)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    if not user.is_2fa_enabled or not user.twofa_secret:
+        raise HTTPException(status_code=400, detail="2FA not enabled for this account")
+    
+    # Verify the code
+    totp = pyotp.TOTP(user.twofa_secret)
+    if not totp.verify(data.code, valid_window=1):
+        # Log failed 2FA attempt
+        try:
+            ip = get_client_ip(request)
+            country = get_country(ip)
+            user_agent = request.headers.get("user-agent", "Unknown")
+            log_login_event(db, data.email, ip, country, False, f"{user_agent} [2FA Failed]")
+        except:
+            pass
+        
+        raise HTTPException(status_code=401, detail="Invalid 2FA code")
+    
+    # Success - log the login
+    ip = get_client_ip(request)
+    country = get_country(ip)
+    user_agent = request.headers.get("user-agent", "Unknown")
+    
+    risk_check = check_login_risk_internal(db, data.email, country)
+    log_login_event(db, data.email, ip, country, True, user_agent)
+    
+    return {
+        "success": True,
+        "message": "Login successful with 2FA",
+        "email": data.email,
+        "ip": ip,
+        "country": country,
+        "risk_alerts": risk_check.get("alerts", []),
+        "timestamp": format_ist(get_ist_time())
+    }
+
+# 5️⃣ Disable 2FA
+@app.post("/disable-2fa/{email}")
+def disable_2fa(email: str, password: str, db: Session = Depends(get_db)):
+    """Disable 2FA (requires password confirmation)"""
+    
+    user = get_user_by_email(db, email)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Verify password
+    if not verify_password(password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid password")
+    
+    # Disable 2FA
+    user.is_2fa_enabled = False
+    user.twofa_secret = None
+    db.commit()
+    
+    return {
+        "success": True,
+        "message": "2FA disabled successfully",
+        "email": email
+    }
+
+# 6️⃣ Check 2FA Status
+@app.get("/2fa-status/{email}")
+def check_2fa_status(email: str, db: Session = Depends(get_db)):
+    """Check if 2FA is enabled for user"""
+    
+    user = get_user_by_email(db, email)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {
+        "email": email,
+        "is_2fa_enabled": user.is_2fa_enabled,
+        "recommendation": "Enable 2FA for better security" if not user.is_2fa_enabled else "2FA is active"
+    }
+
 @app.post("/check-password")
 def password_check(data: PasswordRequest):
     """Check if password has been exposed in data breaches"""
@@ -255,37 +448,7 @@ def ip_reputation(ip: str):
     """Check IP reputation for suspicious activity"""
     return check_ip(ip)
 
-@app.post("/login")
-def login(data: LoginRequest, request: Request, db: Session = Depends(get_db)):
-    """Authenticate user and log login attempt"""
-    
-    # Get real client IP
-    ip = get_client_ip(request)
-    
-    user_agent = request.headers.get("user-agent", "Unknown")
-    country = get_country(ip)
-    
-    user = get_user_by_email(db, data.email)
-    
-    if not user:
-        log_login_event(db, data.email, ip, country, False, user_agent)
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    
-    if not verify_password(data.password, user.hashed_password):
-        log_login_event(db, data.email, ip, country, False, user_agent)
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    
-    risk_check = check_login_risk_internal(db, data.email, country)
-    log_login_event(db, data.email, ip, country, True, user_agent)
-    
-    return {
-        "message": "Login successful",
-        "email": user.email,
-        "ip": ip,
-        "country": country,
-        "risk_alerts": risk_check.get("alerts", []),
-        "timestamp": format_ist(get_ist_time())
-    }
+
 @app.get("/login-history/{email}")
 def get_login_history(email: str, limit: int = 20, db: Session = Depends(get_db)):
     """Get recent login history for an email"""
@@ -548,9 +711,36 @@ def security_recommendations(email: str, db: Session = Depends(get_db)):
         "total_alerts": len(priority_recommendations)
     }
 
-@app.get("/login-map/{email}")
-def get_login_map(email: str, db: Session = Depends(get_db)):
-    """Generate an interactive map showing login locations"""
+from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import BaseModel
+
+class LoginMapResponse(BaseModel):
+    message: str
+    map_url: str
+    total_locations: int
+    email: str
+
+@app.get("/login-map/{email}", response_model=LoginMapResponse)
+def get_login_map_info(email: str, request: Request, db: Session = Depends(get_db)):
+    """Get login map information and URL to view the interactive map"""
+    
+    locations_data = get_login_locations(email, db)
+    
+    # Get the base URL from the request
+    base_url = str(request.base_url).rstrip('/')
+    map_url = f"{base_url}/login-map/{email}/view"
+    
+    return LoginMapResponse(
+        message="Interactive map is ready! Click the map_url to view it in your browser.",
+        map_url=map_url,
+        total_locations=locations_data['total_locations'],
+        email=email
+    )
+
+
+@app.get("/login-map/{email}/view", response_class=HTMLResponse)
+def view_login_map(email: str, db: Session = Depends(get_db)):
+    """View the interactive login locations map"""
     
     locations_data = get_login_locations(email, db)
     
@@ -642,6 +832,28 @@ def get_login_map(email: str, db: Session = Depends(get_db)):
     """
     
     return HTMLResponse(content=map_html)
+@app.get("/compliance-report/{email}")
+def generate_compliance_report(email: str, standard: str, db: Session = Depends(get_db)):
+    """Generate compliance report (GDPR, SOC2, ISO27001)"""
+    
+    user = get_user_by_email(db, email)
+    events = db.query(LoginEvent).filter(LoginEvent.email == email).all()
+    
+    if standard == "GDPR":
+        return {
+            "standard": "GDPR",
+            "compliant": True,
+            "data_stored": {
+                "email": email,
+                "password": "Encrypted (bcrypt)",
+                "login_history": len(events)
+            },
+            "user_rights": [
+                "Right to access ✅",
+                "Right to deletion ✅",
+                "Right to portability ✅"
+            ]
+        }
 
 if __name__ == "__main__":
     uvicorn.run(

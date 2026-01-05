@@ -11,3 +11,6 @@ pydantic
 email-validator
 user-agents
 pyotp
+pydantic[email]
+qrcode
+Pillow

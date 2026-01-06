@@ -52,7 +52,3 @@ class LoginEvent(Base):
     success = Column(Boolean)
     timestamp = Column(DateTime, default=get_ist_time)  # IST time
     user_agent = Column(String, nullable=True)
-    latitude = Column(Float, default=0.0)
-    longitude = Column(Float, default=0.0)
-    location_source = Column(String, default="ip_api")  # 'browser_gps', 'ip_api', 'ipgeolocation.io', etc.
-    location_accuracy = Column(String, default="medium")

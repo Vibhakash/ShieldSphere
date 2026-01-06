@@ -18,6 +18,10 @@ import pyotp
 import qrcode
 import io
 from fastapi.responses import StreamingResponse
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+
 
 # ---------------- IST TIMEZONE ----------------
 IST = pytz.timezone('Asia/Kolkata')
@@ -25,6 +29,13 @@ IST = pytz.timezone('Asia/Kolkata')
 # ---------------- APP ----------------
 app = FastAPI(title="ShieldSphere - Account Safety System")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,  # must be False with "*"
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 Base.metadata.create_all(engine)
 
 # ---------------- DATABASE DEPENDENCY ----------------
@@ -865,4 +876,3 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 8000)),
         reload=False
     )
-    

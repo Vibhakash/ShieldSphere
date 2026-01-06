@@ -281,3 +281,5 @@ def get_multiple_ip_details(ips: list) -> Dict[str, Dict]:
             results[ip] = get_ip_details(ip)
     
     return results
+
+

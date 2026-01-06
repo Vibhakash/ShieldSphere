@@ -228,8 +228,8 @@ def login(data: LoginRequest, request: Request, db: Session = Depends(get_db)):
     # Get real client IP
     ip = get_client_ip(request)
     user_agent = request.headers.get("user-agent", "Unknown")
-    country = get_country(ip)
-    
+    ip_details = get_ip_details(ip)
+    country = ip_details.get("country", "Unknown")
     user = get_user_by_email(db, data.email)
     
     if not user:
@@ -344,7 +344,8 @@ def verify_login_2fa(data: TwoFAVerify, request: Request, db: Session = Depends(
         # Log failed 2FA attempt
         try:
             ip = get_client_ip(request)
-            country = get_country(ip)
+            ip_details = get_ip_details(ip)
+            country = ip_details.get("country", "Unknown")
             user_agent = request.headers.get("user-agent", "Unknown")
             log_login_event(db, data.email, ip, country, False, f"{user_agent} [2FA Failed]")
         except:
@@ -354,7 +355,9 @@ def verify_login_2fa(data: TwoFAVerify, request: Request, db: Session = Depends(
     
     # Success - log the login
     ip = get_client_ip(request)
-    country = get_country(ip)
+    ip_details = get_ip_details(ip)
+    country = ip_details.get("country", "Unknown")
+
     user_agent = request.headers.get("user-agent", "Unknown")
     
     risk_check = check_login_risk_internal(db, data.email, country)

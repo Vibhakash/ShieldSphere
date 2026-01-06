@@ -4,6 +4,7 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 import bcrypt
+import requests
 import uvicorn
 import pytz
 from database import Base, engine, SessionLocal
@@ -18,7 +19,7 @@ import pyotp
 import qrcode
 import io
 from fastapi.responses import StreamingResponse
-
+from typing import Optional
 # ---------------- IST TIMEZONE ----------------
 IST = pytz.timezone('Asia/Kolkata')
 
@@ -50,6 +51,15 @@ class UserRegistration(BaseModel):
     email: EmailStr
     password: str
 
+class BrowserLocation(BaseModel):
+    latitude: float
+    longitude: float
+    accuracy: float  # in meters
+
+class EnhancedLoginRequest(BaseModel):
+    email: str
+    password: str
+    browser_location: Optional[BrowserLocation] = None
 # ---------------- HELPER FUNCTIONS ----------------
 def get_ist_time():
     """Get current time in IST"""
@@ -221,23 +231,59 @@ def register_user(data: UserRegistration, db: Session = Depends(get_db)):
         "created_at": format_ist(new_user.created_at)
     }
 
+
+# Enhanced login endpoint - replace your existing /login
 @app.post("/login")
-def login(data: LoginRequest, request: Request, db: Session = Depends(get_db)):
-    """Authenticate user and log login attempt"""
+def login(data: EnhancedLoginRequest, request: Request, db: Session = Depends(get_db)):
+    """
+    Enhanced login with both IP geolocation AND browser geolocation
+    This gives you EXACT location when user permits
+    """
     
     # Get real client IP
     ip = get_client_ip(request)
     user_agent = request.headers.get("user-agent", "Unknown")
+    
+    # Get IP-based location (fallback)
     ip_details = get_ip_details(ip)
     country = ip_details.get("country", "Unknown")
+    
+    # Use browser location if available (EXACT location)
+    if data.browser_location:
+        latitude = data.browser_location.latitude
+        longitude = data.browser_location.longitude
+        accuracy = data.browser_location.accuracy
+        location_source = "browser_gps"
+        location_accuracy = "exact"
+        
+        # Reverse geocode to get city/region from coordinates
+        city, region = reverse_geocode(latitude, longitude)
+        
+        location_string = f"{city}, {region}, {country}"
+    else:
+        # Use IP-based location
+        latitude = ip_details.get("latitude", 0)
+        longitude = ip_details.get("longitude", 0)
+        accuracy = "city_level"
+        location_source = ip_details.get("source", "ip_api")
+        location_accuracy = ip_details.get("accuracy", "medium")
+        location_string = ip_details.get("location_string", "Unknown")
+    
+    # Authenticate user
     user = get_user_by_email(db, data.email)
     
     if not user:
-        log_login_event(db, data.email, ip, country, False, user_agent)
+        log_login_event(
+            db, data.email, ip, country, False, user_agent,
+            latitude, longitude, location_source, location_accuracy
+        )
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
     if not verify_password(data.password, user.hashed_password):
-        log_login_event(db, data.email, ip, country, False, user_agent)
+        log_login_event(
+            db, data.email, ip, country, False, user_agent,
+            latitude, longitude, location_source, location_accuracy
+        )
         raise HTTPException(status_code=401, detail="Invalid email or password")
     
     # Check if 2FA is enabled
@@ -249,19 +295,93 @@ def login(data: LoginRequest, request: Request, db: Session = Depends(get_db)):
             "instruction": "Please provide your 6-digit 2FA code"
         }
     
-    # No 2FA - proceed with login
+    # Success - log with enhanced location data
     risk_check = check_login_risk_internal(db, data.email, country)
-    log_login_event(db, data.email, ip, country, True, user_agent)
+    log_login_event(
+        db, data.email, ip, country, True, user_agent,
+        latitude, longitude, location_source, location_accuracy
+    )
     
     return {
         "message": "Login successful",
         "email": user.email,
         "ip": ip,
         "country": country,
+        "location": location_string,
+        "location_accuracy": location_accuracy,
+        "coordinates": {
+            "lat": latitude,
+            "lng": longitude
+        },
         "risk_alerts": risk_check.get("alerts", []),
         "timestamp": format_ist(get_ist_time()),
         "2fa_enabled": False
     }
+
+
+def reverse_geocode(lat: float, lng: float) -> tuple:
+    """
+    Reverse geocode coordinates to get city/region
+    Uses Nominatim (OpenStreetMap) - free and accurate
+    """
+    try:
+        url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lng}"
+        headers = {"User-Agent": "ShieldSphere/1.0"}
+        response = requests.get(url, headers=headers, timeout=5)
+        
+        if response.status_code == 200:
+            data = response.json()
+            address = data.get("address", {})
+            
+            city = (
+                address.get("city") or 
+                address.get("town") or 
+                address.get("village") or 
+                address.get("suburb") or
+                "Unknown"
+            )
+            
+            region = (
+                address.get("state") or 
+                address.get("province") or 
+                address.get("region") or
+                "Unknown"
+            )
+            
+            return city, region
+    except:
+        pass
+    
+    return "Unknown", "Unknown"
+
+
+def log_login_event(db: Session, email: str, ip: str, country: str, 
+                            success: bool, user_agent: str,
+                            latitude: float, longitude: float,
+                            location_source: str, location_accuracy: str):
+    """
+    Enhanced login event logging with precise coordinates
+    
+    NOTE: You'll need to add these columns to your LoginEvent model:
+    - latitude (Float)
+    - longitude (Float)
+    - location_source (String)
+    - location_accuracy (String)
+    """
+    event = LoginEvent(
+        email=email,
+        ip_address=ip,
+        country=country,
+        success=success,
+        user_agent=user_agent,
+        latitude=latitude,
+        longitude=longitude,
+        location_source=location_source,
+        location_accuracy=location_accuracy
+    )
+    db.add(event)
+    db.commit()
+    return event
 
 @app.post("/auto-respond/{email}")
 def auto_respond_to_threat(email: str, threat_type: str, db: Session = Depends(get_db)):
